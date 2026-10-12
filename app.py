@@ -18,7 +18,7 @@ st.caption("Вероятности исходов, тоталы, обе забь
 REQUIRED = ["Date", "HomeTeam", "AwayTeam", "HomeGoals", "AwayGoals"]
 
 def load_matches(file):
-df = pd.read_csv(file)
+    df = pd.read_csv(file)
 missing = [c for c in REQUIRED if c not in df.columns]
 if missing:
 raise ValueError("Нет колонок: " + ", ".join(missing))
