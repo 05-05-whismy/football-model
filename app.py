@@ -1,320 +1,501 @@
 
-import streamlit as st
+import requests
 import pandas as pd
-import numpy as np
-from scipy.stats import poisson
-from sklearn.metrics import log_loss
+import streamlit as st
+from datetime import date, timedelta
 
-st.set_page_config(page_title="Football Analytics", page_icon="⚽", layout="wide")
+API_URL = "https://v3.football.api-sports.io"
+
+st.set_page_config(
+    page_title="Football Analytics",
+    page_icon="⚽",
+    layout="wide",
+)
 
 st.title("⚽ Football Analytics")
-st.caption("Анализ футбольных матчей на основе исторических результатов")
+st.caption("Расписание • результаты • форма • статистика • коэффициенты")
 
-REQUIRED = ["Date", "HomeTeam", "AwayTeam", "HomeGoals", "AwayGoals"]
+# Ключ задаётся через Streamlit Secrets
+API_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
+
+if not API_KEY:
+    st.error(
+        "Не найден API-ключ. Добавь API_FOOTBALL_KEY "
+        "в Settings → Secrets в Streamlit."
+    )
+    st.stop()
 
 
-def load_matches(file):
-    df = pd.read_csv(file)
-    missing = [col for col in REQUIRED if col not in df.columns]
+class APIError(Exception):
+    pass
 
-    if missing:
-        raise ValueError("Не хватает колонок: " + ", ".join(missing))
 
-    df = df[REQUIRED].copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["HomeTeam"] = df["HomeTeam"].astype("string").str.strip()
-    df["AwayTeam"] = df["AwayTeam"].astype("string").str.strip()
-    df["HomeGoals"] = pd.to_numeric(df["HomeGoals"], errors="coerce")
-    df["AwayGoals"] = pd.to_numeric(df["AwayGoals"], errors="coerce")
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_get(endpoint, params_tuple=()):
+    params = dict(params_tuple)
+    response = requests.get(
+        f"{API_URL}/{endpoint.lstrip('/')}",
+        headers={"x-apisports-key": API_KEY},
+        params=params,
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
 
-    df = df.dropna(subset=REQUIRED)
-    df = df[
-        (df["HomeTeam"] != "")
-        & (df["AwayTeam"] != "")
-        & (df["HomeGoals"] >= 0)
-        & (df["AwayGoals"] >= 0)
-        & (df["HomeGoals"] % 1 == 0)
-        & (df["AwayGoals"] % 1 == 0)
+    errors = payload.get("errors")
+    if errors:
+        raise APIError(str(errors))
+
+    return payload.get("response", [])
+
+
+def get_data(endpoint, params=None):
+    params = params or {}
+    return api_get(endpoint, tuple(sorted(params.items())))
+
+
+def safe_get(endpoint, params=None):
+    try:
+        return get_data(endpoint, params)
+    except Exception as exc:
+        st.warning(f"Не удалось получить данные: {exc}")
+        return []
+
+
+def table_from_dicts(items):
+    if not items:
+        st.info("Данные пока недоступны для выбранного турнира или матча.")
+        return
+    st.dataframe(pd.json_normalize(items), use_container_width=True)
+
+
+def team_name(team):
+    return team.get("name", "Неизвестно")
+
+
+def match_label(fixture):
+    home = team_name(fixture["teams"]["home"])
+    away = team_name(fixture["teams"]["away"])
+    goals = fixture.get("goals", {})
+    home_goals = goals.get("home")
+    away_goals = goals.get("away")
+    status = fixture.get("fixture", {}).get("status", {})
+    elapsed = status.get("elapsed")
+    short = status.get("short", "")
+    score = (
+        f"{home_goals} : {away_goals}"
+        if home_goals is not None and away_goals is not None
+        else "— : —"
+    )
+    clock = f" • {elapsed}'" if elapsed is not None else ""
+    return f"{home} {score} {away} • {short}{clock}"
+
+
+# API usage is cached. Reference lists are refreshed once per day.
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_leagues():
+    return api_get("leagues", (("current", "true"),))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fixtures_for_date(day):
+    return api_get(
+        "fixtures",
+        tuple(sorted({
+            "date": str(day),
+            "timezone": "Europe/Berlin",
+        }.items())),
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_live_fixtures():
+    return api_get("fixtures", (("live", "all"),))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_standings(league_id, season):
+    return api_get(
+        "standings",
+        tuple(sorted({"league": league_id, "season": season}.items())),
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_team_fixtures(team_id, count=5):
+    return api_get(
+        "fixtures",
+        tuple(sorted({"team": team_id, "last": count}.items())),
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_match_statistics(fixture_id):
+    return api_get("fixtures/statistics", (("fixture", fixture_id),))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_match_odds(fixture_id):
+    return api_get("odds", (("fixture", fixture_id),))
+
+
+# Load competitions
+with st.spinner("Загружаем список соревнований..."):
+    leagues_data = safe_get("leagues", {"current": "true"})
+
+if not leagues_data:
+    st.error(
+        "Список соревнований не загрузился. Проверь API-ключ, "
+        "лимит запросов и статус API."
+    )
+    st.stop()
+
+league_rows = []
+for item in leagues_data:
+    league = item.get("league", {})
+    country = item.get("country", {})
+    seasons = item.get("seasons", [])
+    current_seasons = [s for s in seasons if s.get("current")]
+    season = (
+        current_seasons[-1].get("year")
+        if current_seasons
+        else (seasons[-1].get("year") if seasons else date.today().year)
+    )
+
+    league_rows.append({
+        "id": league.get("id"),
+        "name": league.get("name", "Unknown"),
+        "country": country.get("name", "International"),
+        "season": season,
+        "type": league.get("type", ""),
+    })
+
+leagues_df = pd.DataFrame(league_rows).dropna(subset=["id"])
+if leagues_df.empty:
+    st.error("API не вернул доступные соревнования.")
+    st.stop()
+
+# Sidebar filters
+st.sidebar.header("Настройки")
+
+countries = ["Все страны"] + sorted(
+    leagues_df["country"].dropna().unique().tolist()
+)
+selected_country = st.sidebar.selectbox("Страна", countries)
+
+filtered = leagues_df.copy()
+if selected_country != "Все страны":
+    filtered = filtered[filtered["country"] == selected_country]
+
+search = st.sidebar.text_input("Найти лигу или кубок")
+if search.strip():
+    filtered = filtered[
+        filtered["name"].str.contains(search.strip(), case=False, na=False)
     ]
 
-    df["HomeGoals"] = df["HomeGoals"].astype(int)
-    df["AwayGoals"] = df["AwayGoals"].astype(int)
-    df = df.sort_values("Date").reset_index(drop=True)
+if filtered.empty:
+    st.warning("По этому фильтру турниры не найдены.")
+    st.stop()
 
-    if len(df) < 20:
-        raise ValueError("После очистки осталось меньше 20 матчей.")
+filtered["label"] = (
+    filtered["country"] + " — " + filtered["name"]
+    + " (" + filtered["season"].astype(str) + ")"
+)
+selected_label = st.sidebar.selectbox(
+    "Турнир",
+    filtered["label"].tolist(),
+)
+selected_league = filtered[filtered["label"] == selected_label].iloc[0]
+league_id = int(selected_league["id"])
+season = int(selected_league["season"])
 
-    return df
-
-
-def fit_ratings(history, smoothing=5):
-    avg_home = max(float(history["HomeGoals"].mean()), 0.1)
-    avg_away = max(float(history["AwayGoals"].mean()), 0.1)
-
-    teams = set(history["HomeTeam"]) | set(history["AwayTeam"])
-    ratings = {}
-
-    for team in teams:
-        home = history[history["HomeTeam"] == team]
-        away = history[history["AwayTeam"] == team]
-
-        home_scored = (
-            home["HomeGoals"].sum() + smoothing * avg_home
-        ) / (len(home) + smoothing)
-
-        home_conceded = (
-            home["AwayGoals"].sum() + smoothing * avg_away
-        ) / (len(home) + smoothing)
-
-        away_scored = (
-            away["AwayGoals"].sum() + smoothing * avg_away
-        ) / (len(away) + smoothing)
-
-        away_conceded = (
-            away["HomeGoals"].sum() + smoothing * avg_home
-        ) / (len(away) + smoothing)
-
-        ratings[team] = {
-            "ha": home_scored / avg_home,
-            "hd": home_conceded / avg_away,
-            "aa": away_scored / avg_away,
-            "ad": away_conceded / avg_home,
-        }
-
-    return ratings, avg_home, avg_away
-
-
-def predict(home, away, ratings, avg_home, avg_away):
-    h = ratings.get(home, {})
-    a = ratings.get(away, {})
-
-    xg_home = max(
-        0.05, min(5.5, avg_home * h.get("ha", 1) * a.get("ad", 1))
-    )
-    xg_away = max(
-        0.05, min(5.5, avg_away * a.get("aa", 1) * h.get("hd", 1))
-    )
-
-    max_goals = 15
-    hp = poisson.pmf(np.arange(max_goals + 1), xg_home)
-    ap = poisson.pmf(np.arange(max_goals + 1), xg_away)
-
-    hp[-1] += max(0, 1 - hp.sum())
-    ap[-1] += max(0, 1 - ap.sum())
-
-    matrix = np.outer(hp, ap)
-
-    p_home = float(np.tril(matrix, -1).sum())
-    p_draw = float(np.trace(matrix))
-    p_away = float(np.triu(matrix, 1).sum())
-    btts = float(matrix[1:, 1:].sum())
-
-    totals = {}
-    for line in (1.5, 2.5, 3.5):
-        over = sum(
-            matrix[i, j]
-            for i in range(max_goals + 1)
-            for j in range(max_goals + 1)
-            if i + j > line
-        )
-        totals[f"ТБ {line}"] = float(over)
-        totals[f"ТМ {line}"] = float(1 - over)
-
-    return {
-        "xG хозяев": xg_home,
-        "xG гостей": xg_away,
-        "Победа хозяев": p_home,
-        "Ничья": p_draw,
-        "Победа гостей": p_away,
-        "Обе забьют — Да": btts,
-        "Обе забьют — Нет": 1 - btts,
-        **totals,
-    }
-
-
-def percent(value):
-    return f"{value * 100:.1f}%"
-
-
-st.subheader("1. Исторические данные")
-st.write(
-    "CSV должен содержать Date, HomeTeam, AwayTeam, HomeGoals, AwayGoals."
+st.caption(
+    f"Выбран турнир: {selected_league['name']} · "
+    f"{selected_league['country']} · сезон {season}"
 )
 
-template = pd.DataFrame({
-    "Date": ["2026-08-15", "2026-08-16"],
-    "HomeTeam": ["Arsenal", "Chelsea"],
-    "AwayTeam": ["Man City", "Liverpool"],
-    "HomeGoals": [2, 1],
-    "AwayGoals": [1, 1],
-})
+tabs = st.tabs([
+    "📅 Матчи",
+    "🏆 Таблица",
+    "📈 Форма команд",
+    "📊 Статистика",
+    "💹 Коэффициенты",
+])
 
-st.download_button(
-    "Скачать пример CSV",
-    template.to_csv(index=False).encode("utf-8"),
-    file_name="matches_template.csv",
-    mime="text/csv",
-)
+# Tab 1: schedule, results and live
+with tabs[0]:
+    st.subheader("Расписание и результаты")
 
-uploaded = st.file_uploader("Загрузить историю матчей", type=["csv"])
-
-if "matches" not in st.session_state:
-    st.session_state.matches = None
-
-if uploaded is not None:
-    try:
-        st.session_state.matches = load_matches(uploaded)
-        st.success(f"Загружено матчей: {len(st.session_state.matches)}")
-    except Exception as error:
-        st.session_state.matches = None
-        st.error(f"Ошибка CSV: {error}")
-
-df = st.session_state.matches
-
-if df is not None:
-    st.write(
-        f"Период: {df['Date'].min().date()} — {df['Date'].max().date()}"
-    )
-    st.dataframe(df.tail(10), use_container_width=True)
-
-    st.divider()
-    st.subheader("2. Прогноз матча")
-
-    teams = sorted(set(df["HomeTeam"]) | set(df["AwayTeam"]))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        home = st.selectbox("Хозяева", teams, index=0)
-    with col2:
-        away = st.selectbox(
-            "Гости", teams, index=min(1, len(teams) - 1)
-        )
-
-    if home == away:
-        st.warning("Выбери две разные команды.")
-    elif st.button("Рассчитать прогноз", type="primary"):
-        ratings, avg_home, avg_away = fit_ratings(df)
-        result = predict(home, away, ratings, avg_home, avg_away)
-
-        st.markdown(f"### {home} — {away}")
-
-        c1, c2 = st.columns(2)
-        c1.metric("Ожидаемые голы хозяев", f"{result['xG хозяев']:.2f}")
-        c2.metric("Ожидаемые голы гостей", f"{result['xG гостей']:.2f}")
-
-        st.subheader("Вероятности исходов")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Победа хозяев", percent(result["Победа хозяев"]))
-        c2.metric("Ничья", percent(result["Ничья"]))
-        c3.metric("Победа гостей", percent(result["Победа гостей"]))
-
-        st.subheader("Тоталы и обе забьют")
-        c1, c2 = st.columns(2)
-        c1.metric("Обе забьют — Да", percent(result["Обе забьют — Да"]))
-        c2.metric("Обе забьют — Нет", percent(result["Обе забьют — Нет"]))
-
-        totals_df = pd.DataFrame([
-            {"Рынок": key, "Вероятность": percent(value),
-             "Справедливый коэффициент": (
-                 f"{1 / value:.2f}" if value > 0 else "—"
-             )}
-            for key, value in result.items()
-            if key.startswith("ТБ") or key.startswith("ТМ")
-        ])
-        st.dataframe(totals_df, use_container_width=True)
-
-        st.subheader("3. Сравнение с коэффициентом")
-        market = st.selectbox(
-            "Выбери рынок",
-            [key for key in result if key not in ("xG хозяев", "xG гостей")],
-        )
-        odds = st.number_input(
-            "Коэффициент букмекера",
-            min_value=1.01,
-            max_value=1000.0,
-            value=1.80,
-            step=0.01,
-        )
-
-        probability = result[market]
-        fair_odds = 1 / probability if probability > 0 else float("inf")
-        ev = (probability * odds - 1) * 100
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Вероятность модели", percent(probability))
-        c2.metric("Справедливый коэффициент", f"{fair_odds:.2f}")
-        c3.metric("Расчётный EV", f"{ev:+.1f}%")
-
-        st.warning(
-            "Это упрощённая статистическая модель. Положительный EV "
-            "не доказывает реальное преимущество и не гарантирует прибыль."
-        )
-
-    st.divider()
-    st.subheader("4. Исторический бэктест")
-    st.caption(
-        "Каждый матч прогнозируется по более ранним матчам. "
-        "Для корректной оценки желательно использовать достаточно большую историю."
+    mode = st.radio(
+        "Показать",
+        ["По дате", "Лайв", "Матчи выбранной лиги"],
+        horizontal=True,
     )
 
-    max_start = len(df) - 5
-    start_n = st.number_input(
-        "Матчей в начальном обучающем окне",
-        min_value=10,
-        max_value=max_start,
-        value=min(100, max_start),
-        step=10,
+    if mode == "По дате":
+        selected_date = st.date_input("Дата", value=date.today())
+        with st.spinner("Загружаем матчи..."):
+            matches = safe_get(
+                "fixtures",
+                {
+                    "date": str(selected_date),
+                    "timezone": "Europe/Berlin",
+                },
+            )
+    elif mode == "Лайв":
+        with st.spinner("Загружаем текущие матчи..."):
+            matches = safe_get("fixtures", {"live": "all"})
+    else:
+        start = st.date_input(
+            "Начало периода",
+            value=date.today(),
+            key="start_date",
+        )
+        end = st.date_input(
+            "Конец периода",
+            value=date.today() + timedelta(days=7),
+            key="end_date",
+        )
+        if end < start:
+            st.error("Конец периода не может быть раньше начала.")
+            matches = []
+        else:
+            matches = safe_get(
+                "fixtures",
+                {
+                    "league": league_id,
+                    "season": season,
+                    "from": str(start),
+                    "to": str(end),
+                    "timezone": "Europe/Berlin",
+                },
+            )
+
+    if matches:
+        rows = []
+        for m in matches:
+            fixture = m.get("fixture", {})
+            league = m.get("league", {})
+            rows.append({
+                "Дата": fixture.get("date", "")[:16].replace("T", " "),
+                "Страна": league.get("country", ""),
+                "Лига": league.get("name", ""),
+                "Матч": match_label(m),
+                "Стадион": (fixture.get("venue") or {}).get("name", ""),
+                "ID матча": fixture.get("id"),
+            })
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Выбери матч по ID в разделе статистики или коэффициентов.")
+    else:
+        st.info("Матчи не найдены или данные пока не доступны.")
+
+    if st.button("Обновить расписание"):
+        st.cache_data.clear()
+        st.rerun()
+
+# Tab 2: standings
+with tabs[1]:
+    st.subheader(f"Таблица: {selected_league['name']}")
+    standings_data = safe_get(
+        "standings",
+        {"league": league_id, "season": season},
     )
 
-    if st.button("Запустить бэктест"):
-        predictions = []
-        actual = []
-        progress = st.progress(0)
+    if standings_data:
+        league_info = standings_data[0].get("league", {})
+        groups = league_info.get("standings", [])
+        for index, group in enumerate(groups, start=1):
+            if len(groups) > 1:
+                st.markdown(f"**Группа {index}**")
+            rows = []
+            for team in group:
+                rows.append({
+                    "Место": team.get("rank"),
+                    "Команда": (team.get("team") or {}).get("name"),
+                    "И": (team.get("all") or {}).get("played"),
+                    "В": (team.get("all") or {}).get("win"),
+                    "Н": (team.get("all") or {}).get("draw"),
+                    "П": (team.get("all") or {}).get("lose"),
+                    "Голы": (
+                        f"{(team.get('all') or {}).get('goals', {}).get('for', 0)}:"
+                        f"{(team.get('all') or {}).get('goals', {}).get('against', 0)}"
+                    ),
+                    "Разница": team.get("goalsDiff"),
+                    "Очки": team.get("points"),
+                    "Форма": team.get("form") or "—",
+                })
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    else:
+        st.info("Таблица для этого соревнования недоступна.")
 
-        for idx in range(int(start_n), len(df)):
-            past = df.iloc[:idx]
-            row = df.iloc[idx]
-            ratings, avg_home, avg_away = fit_ratings(past)
-            pred = predict(row["HomeTeam"], row["AwayTeam"],
-                           ratings, avg_home, avg_away)
+# Tab 3: team form
+with tabs[2]:
+    st.subheader("Последние матчи команды")
 
-            predictions.append([
-                pred["Победа хозяев"],
-                pred["Ничья"],
-                pred["Победа гостей"],
-            ])
+    team_search = st.text_input(
+        "Название команды",
+        placeholder="Например, Arsenal",
+    )
 
-            if row["HomeGoals"] > row["AwayGoals"]:
-                actual.append(0)
-            elif row["HomeGoals"] == row["AwayGoals"]:
-                actual.append(1)
+    if team_search.strip() and len(team_search.strip()) >= 3:
+        teams = safe_get("teams", {"search": team_search.strip()})
+        if teams:
+            options = {
+                f"{t.get('team', {}).get('name')} — "
+                f"{t.get('team', {}).get('country', '')} "
+                f"(ID {t.get('team', {}).get('id')})":
+                int(t.get("team", {}).get("id"))
+                for t in teams
+                if t.get("team", {}).get("id") is not None
+            }
+
+            if options:
+                chosen_team = st.selectbox(
+                    "Выбери команду",
+                    list(options.keys()),
+                )
+                team_id = options[chosen_team]
+
+                recent = safe_get(
+                    "fixtures",
+                    {"team": team_id, "last": 10},
+                )
+
+                if recent:
+                    result_rows = []
+                    for m in recent:
+                        goals = m.get("goals", {})
+                        home = m.get("teams", {}).get("home", {})
+                        away = m.get("teams", {}).get("away", {})
+                        hg, ag = goals.get("home"), goals.get("away")
+                        team_is_home = home.get("id") == team_id
+
+                        if hg is None or ag is None:
+                            result = "Не завершён"
+                        else:
+                            team_goals = hg if team_is_home else ag
+                            opponent_goals = ag if team_is_home else hg
+                            result = (
+                                "В" if team_goals > opponent_goals
+                                else "Н" if team_goals == opponent_goals
+                                else "П"
+                            )
+
+                        result_rows.append({
+                            "Дата": m.get("fixture", {}).get("date", "")[:10],
+                            "Турнир": m.get("league", {}).get("name", ""),
+                            "Матч": match_label(m),
+                            "Итог команды": result,
+                        })
+
+                    st.dataframe(
+                        pd.DataFrame(result_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("История матчей не найдена.")
+        else:
+            st.info("Команда не найдена.")
+    else:
+        st.info("Введи минимум 3 символа названия команды.")
+
+# Tab 4: match statistics
+with tabs[3]:
+    st.subheader("Статистика конкретного матча")
+    fixture_id = st.number_input(
+        "ID матча",
+        min_value=1,
+        step=1,
+        value=None,
+        placeholder="Введи ID из раздела «Матчи»",
+    )
+
+    if st.button("Загрузить статистику", key="stats_button"):
+        if fixture_id:
+            stats_data = safe_get(
+                "fixtures/statistics",
+                {"fixture": int(fixture_id)},
+            )
+            if stats_data:
+                rows = []
+                for team_stats in stats_data:
+                    team = (team_stats.get("team") or {}).get("name", "")
+                    for stat in team_stats.get("statistics", []):
+                        rows.append({
+                            "Команда": team,
+                            "Показатель": stat.get("type"),
+                            "Значение": stat.get("value"),
+                        })
+                if rows:
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("У матча нет доступной статистики.")
             else:
-                actual.append(2)
+                st.info("Статистика отсутствует или ещё не загружена.")
+        else:
+            st.warning("Сначала введи ID матча.")
 
-            progress.progress((idx - int(start_n) + 1) / (len(df) - int(start_n)))
+# Tab 5: odds
+with tabs[4]:
+    st.subheader("Коэффициенты букмекеров")
+    odds_fixture_id = st.number_input(
+        "ID матча для коэффициентов",
+        min_value=1,
+        step=1,
+        value=None,
+        placeholder="Введи ID матча",
+        key="odds_fixture_id",
+    )
 
-        probs = np.asarray(predictions)
-        actual = np.asarray(actual)
-        one_hot = np.eye(3)[actual]
-        brier = float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
-        loss = float(log_loss(actual, probs, labels=[0, 1, 2]))
-        accuracy = float(np.mean(probs.argmax(axis=1) == actual))
+    if st.button("Загрузить коэффициенты", key="odds_button"):
+        if odds_fixture_id:
+            odds_data = safe_get(
+                "odds",
+                {"fixture": int(odds_fixture_id)},
+            )
+            rows = []
+            for entry in odds_data:
+                for bookmaker in entry.get("bookmakers", []):
+                    for bet in bookmaker.get("bets", []):
+                        for value in bet.get("values", []):
+                            rows.append({
+                                "Букмекер": bookmaker.get("name"),
+                                "Рынок": bet.get("name"),
+                                "Исход": value.get("value"),
+                                "Коэффициент": value.get("odd"),
+                            })
 
-        st.subheader("Результаты бэктеста")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Accuracy", percent(accuracy))
-        c2.metric("Log loss", f"{loss:.3f}")
-        c3.metric("Brier score", f"{brier:.3f}")
-        st.caption(f"Проверено матчей: {len(actual)}")
-        st.warning(
-            "Бэктест оценивает качество вероятностей, а не доходность ставок."
-        )
-
-else:
-    st.info("Загрузи CSV с историей матчей, чтобы получить прогноз.")
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info(
+                    "Коэффициенты не найдены. Возможно, для матча "
+                    "нет доступного рынка или данные не покрываются тарифом."
+                )
+        else:
+            st.warning("Сначала введи ID матча.")
 
 st.divider()
 st.caption(
-    "Автоматическая загрузка матчей и букмекерских коэффициентов "
-    "пока не подключена. Прогнозы не гарантируют финансовый результат."
+    "Источник данных: API-Football. Статистика, xG и коэффициенты "
+    "зависят от покрытия конкретного матча. Данные API могут обновляться "
+    "с задержкой. Модель не гарантирует прибыль."
 )
